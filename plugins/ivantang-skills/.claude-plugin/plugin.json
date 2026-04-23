@@ -1,0 +1,12 @@
+{
+  "name": "ivantang-skills",
+  "description": "Ivan Tang's personal skill bundle for Claude Code.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Ivan Tang",
+    "email": "hiimivantang@gmail.com"
+  },
+  "homepage": "https://github.com/hiimivantang/ivantang-skills",
+  "repository": "https://github.com/hiimivantang/ivantang-skills",
+  "keywords": ["skills", "byd", "automation"]
+}
