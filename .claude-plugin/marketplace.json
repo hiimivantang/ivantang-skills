@@ -12,7 +12,7 @@
     {
       "name": "ivantang-skills",
       "source": "./plugins/ivantang-skills",
-      "description": "Personal skills bundle (BYD remote control and more)."
+      "description": "Personal skills bundle (BYD remote control, SGExam paper downloader, and more)."
     }
   ]
 }
