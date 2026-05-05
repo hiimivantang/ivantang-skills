@@ -2,66 +2,67 @@
 """
 Milvus sizing calculator — bundled script for the milvus-sizing skill.
 
-Formulas sourced from https://milvus.io/tools/sizing (official Milvus sizing tool).
-Reference: Vector Index Size Estimation (internal Milvus doc, Feb 2025).
+Formulas match the official Milvus sizing tool source code:
+https://github.com/milvus-io/milvus.io/blob/master/src/utils/sizingTool.ts
 
 Usage:
   python milvus_sizing.py --vectors 1000000 --dim 1536
-  python milvus_sizing.py --vectors 1e9 --dim 768 --hnsw-m 16 --node-memory-gb 128
+  python milvus_sizing.py --vectors 1e9 --dim 768 --hnsw-m 16
   python milvus_sizing.py --vectors 5e6 --dim 1536 --index diskann
+  python milvus_sizing.py --vectors 1e6 --dim 1536 --json   # machine-readable
 """
 
 import argparse
+import json
 import math
-import sys
 
 BYTES_PER_FLOAT32 = 4
-BYTES_PER_GB = 1024 ** 3
+GiB = 1024 ** 3
+DEFAULT_SEGMENT_GiB = 0.5  # 512 MiB default segment size
 
 
 def fmt(byte_count):
-    """Human-readable byte count."""
-    for unit in ["B", "KB", "MB", "GB", "TB", "PB"]:
+    for unit in ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]:
         if abs(byte_count) < 1024.0:
             return f"{byte_count:.2f} {unit}"
         byte_count /= 1024.0
-    return f"{byte_count:.2f} EB"
+    return f"{byte_count:.2f} EiB"
 
+
+# ---------------------------------------------------------------------------
+# Raw data size
+# ---------------------------------------------------------------------------
 
 def raw_data_size(num_vectors, dim):
+    """vectorRawDataSize = num * d * 4  (float32)"""
     return num_vectors * dim * BYTES_PER_FLOAT32
 
 
 # ---------------------------------------------------------------------------
-# Index memory formulas (Disable mmap / fully in-memory column)
-# Source: Vector Index Size Estimation table
+# Index memory formulas
+# Source: memoryAndDiskCalculator() in sizingTool.ts
 # ---------------------------------------------------------------------------
 
 def hnsw_memory(num_vectors, dim, M=30):
-    # (1 + 2*M/dim) * raw_data_size
+    # (1 + 2*M/d) * rawDataSize
     return (1 + 2 * M / dim) * raw_data_size(num_vectors, dim)
 
 
 def flat_memory(num_vectors, dim):
-    # raw_data_size
     return raw_data_size(num_vectors, dim)
 
 
 def ivf_flat_memory(num_vectors, dim, nlist=128):
-    # raw_data_size + nlist * row_size  (row_size = dim * sizeof(float32))
     row_size = dim * BYTES_PER_FLOAT32
     return raw_data_size(num_vectors, dim) + nlist * row_size
 
 
 def ivf_sq8_memory(num_vectors, dim, nlist=128):
-    # raw_data_size/4 + nlist * row_size
     row_size = dim * BYTES_PER_FLOAT32
     return raw_data_size(num_vectors, dim) / 4 + nlist * row_size
 
 
 def ivf_pq_memory(num_vectors, dim, nlist=128, m=None, nbits=8):
-    # raw_data_size / (dsub * 32 / nbits) + nlist * row_size
-    # dsub = dim / m  (m is the number of sub-quantizers, default dim/8 or dim/4)
     if m is None:
         m = max(1, dim // 8)
     dsub = dim / m
@@ -70,22 +71,18 @@ def ivf_pq_memory(num_vectors, dim, nlist=128, m=None, nbits=8):
 
 
 def scann_memory(num_vectors, dim, with_raw_data=False):
-    # with_raw_data=False: (1/8) * raw_data_size
-    # with_raw_data=True:  (1/8 + 1) * raw_data_size
     raw = raw_data_size(num_vectors, dim)
-    return (1 / 8 + (1 if with_raw_data else 0)) * raw
+    return (9 / 8 if with_raw_data else 1 / 8) * raw
 
 
 def diskann_sizing(num_vectors, dim, max_degree=56):
-    # Memory: raw_data_size / 4
-    # Disk:   (1 + max_degree/dim) * raw_data_size
     raw = raw_data_size(num_vectors, dim)
-    return raw / 4, (1 + max_degree / dim) * raw
+    memory = raw / 4
+    disk = (1 + max_degree / dim) * raw
+    return memory, disk
 
 
 def ivf_rabitq_memory(num_vectors, dim, nlist=128, refine_type="SQ8"):
-    # raw_data_size * (1/32 + N/32) + nlist * row_size
-    # N: SQ6→6, SQ8→8, FP16/BF16→16, FP32→32
     N_map = {"SQ6": 6, "SQ8": 8, "FP16": 16, "BF16": 16, "FP32": 32}
     N = N_map.get(refine_type.upper(), 8)
     raw = raw_data_size(num_vectors, dim)
@@ -94,69 +91,233 @@ def ivf_rabitq_memory(num_vectors, dim, nlist=128, refine_type="SQ8"):
 
 
 # ---------------------------------------------------------------------------
-# Distributed mode node recommendations
+# Loading memory
+# Source: sizingTool.ts — vectorLoadingMemory calculation
+# Formula: (indexMemory + segmentSize * 2) * 1.15
+# DiskANN:  indexMemory * 1.15  (no segment buffer needed)
 # ---------------------------------------------------------------------------
 
-def _next_power_of_two(n):
-    return 2 ** math.ceil(math.log2(max(1, n)))
+def loading_memory(index_memory_bytes, segment_gib=DEFAULT_SEGMENT_GiB, is_diskann=False):
+    if is_diskann:
+        return index_memory_bytes * 1.15
+    segment_bytes = segment_gib * GiB
+    return (index_memory_bytes + segment_bytes * 2) * 1.15
 
 
-def distributed_recommendations(index_memory_bytes, raw_bytes, index_disk_bytes=0, node_memory_gb=64, replicas=1):
-    """
-    Estimate Milvus distributed mode resource requirements.
+# ---------------------------------------------------------------------------
+# Cluster node configuration
+# Source: clusterNodesConfigCalculator() in sizingTool.ts
+# Key tiers (loading_memory_GiB → node specs):
+#   ≤8     : 1 QN (2c/8G),  1 DN (2c/8G),  coord 1c/4G,  proxy 1c/4G
+#   ≤16    : 1 QN (4c/16G), 1 DN (4c/16G), coord 2c/8G,  proxy 2c/8G
+#   ≤32    : 2 QN (4c/16G), 2 DN (4c/16G), coord 2c/8G,  proxy 2c/8G
+#   ≤48    : 3 QN (4c/16G), 2 DN (4c/16G)
+#   ≤64    : 4 QN (4c/16G), 2 DN (4c/16G)
+#   ≤80    : 5 QN (4c/16G), 4 DN (4c/16G)
+#   ≤96    : 6 QN (4c/16G), 4 DN (4c/16G)
+#   ≤512   : ceil(GB/32) QN (8c/32G)
+#   ≤2048  : ceil(GB/64) QN (16c/64G)
+#   >2048  : ceil(GB/128) QN (32c/128G)
+# ---------------------------------------------------------------------------
 
-    Query nodes must hold the full index (× replicas) in memory.
-    A 20 % headroom is added for growing segments and OS/process overhead.
-    """
-    node_mem = node_memory_gb * BYTES_PER_GB
+_SMALL_TIERS = [
+    # (max_gib, qn, qn_cpu, qn_mem, dn, dn_cpu, dn_mem, coord_cpu, coord_mem, proxy_cpu, proxy_mem)
+    (8,   1, 2,  8,  1, 2,  8,  1, 4, 1, 4),
+    (16,  1, 4, 16,  1, 4, 16,  2, 8, 2, 8),
+    (32,  2, 4, 16,  2, 4, 16,  2, 8, 2, 8),
+    (48,  3, 4, 16,  2, 4, 16,  2, 8, 2, 8),
+    (64,  4, 4, 16,  2, 4, 16,  2, 8, 2, 8),
+    (80,  5, 4, 16,  4, 4, 16,  2, 8, 2, 8),
+    (96,  6, 4, 16,  4, 4, 16,  2, 8, 2, 8),
+]
 
-    # Query nodes: replicated index + 20 % overhead
-    effective = index_memory_bytes * replicas * 1.2
-    num_qn = max(2, math.ceil(effective / node_mem))
-    per_qn_gb = math.ceil(effective / num_qn / BYTES_PER_GB)
-    per_qn_gb = _next_power_of_two(max(8, per_qn_gb))
 
-    # Data nodes: handle ingestion (growing segments, WAL replay)
-    # Typical: 2 nodes, 16 GB each covers most workloads up to ~100 M vectors/day
-    num_dn = 2
-    dn_mem_gb = 16
+def cluster_node_config(loading_mem_bytes):
+    gib = loading_mem_bytes / GiB
+    for max_gib, qn, qn_cpu, qn_mem, dn, dn_cpu, dn_mem, coord_cpu, coord_mem, proxy_cpu, proxy_mem in _SMALL_TIERS:
+        if gib <= max_gib:
+            return dict(qn=qn, qn_cpu=qn_cpu, qn_mem=qn_mem,
+                        dn=dn, dn_cpu=dn_cpu, dn_mem=dn_mem,
+                        coord_cpu=coord_cpu, coord_mem=coord_mem,
+                        proxy_cpu=proxy_cpu, proxy_mem=proxy_mem)
 
-    # Index nodes: CPU-intensive index building
-    num_in = 1
-    in_mem_gb = max(32, per_qn_gb)
-    in_cpu = 16
+    if gib <= 512:
+        n = math.ceil(gib / 32)
+        qn_cpu, qn_mem = 8, 32
+    elif gib <= 2048:
+        n = math.ceil(gib / 64)
+        qn_cpu, qn_mem = 16, 64
+    else:
+        n = math.ceil(gib / 128)
+        qn_cpu, qn_mem = 32, 128
 
-    # Object storage (MinIO / S3):
-    #   sealed segment raw data stored in columnar parquet ≈ 60 % of raw float32
-    #   index files are also persisted (same size as in-memory index)
-    minio_bytes = raw_bytes * 0.6 + index_memory_bytes
+    dn = max(2, n // 4)
+    dn_cpu, dn_mem = qn_cpu // 2, qn_mem // 2
+    coord_cpu, coord_mem = min(8, qn_cpu), min(32, qn_mem)
+    proxy_cpu, proxy_mem = min(8, qn_cpu), min(32, qn_mem)
+    return dict(qn=n, qn_cpu=qn_cpu, qn_mem=qn_mem,
+                dn=dn, dn_cpu=dn_cpu, dn_mem=dn_mem,
+                coord_cpu=coord_cpu, coord_mem=coord_mem,
+                proxy_cpu=proxy_cpu, proxy_mem=proxy_mem)
 
-    # etcd: metadata (segments, collections, partitions)
-    # Very small compared to data; 10 GB minimum, grows with segment count
-    num_segments = max(1, math.ceil(raw_bytes / (512 * 1024 * 1024)))
-    etcd_gb = max(10, math.ceil(num_segments * 0.001))  # ~1 MB per 1 000 segments
 
-    return {
-        "num_query_nodes": num_qn,
-        "per_query_node_memory_gb": per_qn_gb,
-        "query_node_cpu": 16,
-        "num_data_nodes": num_dn,
-        "data_node_memory_gb": dn_mem_gb,
-        "data_node_cpu": 8,
-        "num_index_nodes": num_in,
-        "index_node_memory_gb": in_mem_gb,
-        "index_node_cpu": in_cpu,
-        "coordinator_memory_gb": 8,
-        "coordinator_cpu": 4,
-        "minio_bytes": minio_bytes,
-        "etcd_gb": etcd_gb,
-        "index_disk_bytes": index_disk_bytes,
-    }
+# ---------------------------------------------------------------------------
+# Dependency sizing
+# Source: dependencyCalculator() in sizingTool.ts
+# ---------------------------------------------------------------------------
+
+def dependency_sizing(raw_bytes, loading_mem_bytes):
+    raw_gib = raw_bytes / GiB
+    # MinIO PVC: max(ceil(rawDataSize + loadingMemory in GiB), 30)
+    minio_gib = max(math.ceil((raw_bytes + loading_mem_bytes) / GiB), 30)
+    # Pulsar ledgers: max(ceil(rawDataSize in GiB), 20)
+    pulsar_ledgers_gib = max(math.ceil(raw_gib), 20)
+    # Pulsar journal: min(ceil(rawDataSize in GiB) * 0.5, 50)
+    pulsar_journal_gib = min(math.ceil(raw_gib) * 0.5, 50)
+    # etcd: small metadata store — 8 GiB recommended
+    etcd_gib = 8
+    return dict(
+        minio_gib=minio_gib,
+        pulsar_ledgers_gib=pulsar_ledgers_gib,
+        pulsar_journal_gib=pulsar_journal_gib,
+        etcd_gib=etcd_gib,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+def compute(args):
+    num_vectors = int(args.vectors)
+    dim = args.dim
+    idx = args.index.lower()
+    segment_gib = args.segment_size_mb / 1024
+
+    raw = raw_data_size(num_vectors, dim)
+    index_mem = 0
+    index_disk = 0
+    formula_str = ""
+    params_str = ""
+    is_diskann = idx == "diskann"
+
+    if idx == "hnsw":
+        M = args.hnsw_m
+        index_mem = hnsw_memory(num_vectors, dim, M)
+        formula_str = f"(1 + 2×{M}/{dim}) × raw"
+        params_str = f"M={M}"
+    elif idx == "flat":
+        index_mem = flat_memory(num_vectors, dim)
+        formula_str = "raw"
+    elif idx == "ivf_flat":
+        index_mem = ivf_flat_memory(num_vectors, dim, args.nlist)
+        formula_str = "raw + nlist×row_size"
+        params_str = f"nlist={args.nlist}"
+    elif idx == "ivf_sq8":
+        index_mem = ivf_sq8_memory(num_vectors, dim, args.nlist)
+        formula_str = "raw/4 + nlist×row_size"
+        params_str = f"nlist={args.nlist}"
+    elif idx == "ivf_pq":
+        m = args.ivfpq_m or max(1, dim // 8)
+        index_mem = ivf_pq_memory(num_vectors, dim, args.nlist, m, args.ivfpq_nbits)
+        dsub = dim / m
+        formula_str = f"raw/({dsub:.1f}×32/{args.ivfpq_nbits}) + nlist×row_size"
+        params_str = f"nlist={args.nlist}, m={m}, nbits={args.ivfpq_nbits}"
+    elif idx == "scann":
+        index_mem = scann_memory(num_vectors, dim, args.scann_with_raw_data)
+        formula_str = "(9/8)×raw" if args.scann_with_raw_data else "(1/8)×raw"
+        params_str = f"with_raw_data={str(args.scann_with_raw_data).lower()}"
+    elif idx == "diskann":
+        index_mem, index_disk = diskann_sizing(num_vectors, dim, args.diskann_max_degree)
+        formula_str = "mem=raw/4, disk=(1+max_degree/dim)×raw"
+        params_str = f"max_degree={args.diskann_max_degree}"
+    elif idx == "ivf_rabitq":
+        index_mem = ivf_rabitq_memory(num_vectors, dim, args.nlist, args.rabitq_refine_type)
+        N_map = {"SQ6": 6, "SQ8": 8, "FP16": 16, "BF16": 16, "FP32": 32}
+        N = N_map[args.rabitq_refine_type.upper()]
+        formula_str = f"raw×(1+{N})/32 + nlist×row_size"
+        params_str = f"nlist={args.nlist}, refine_type={args.rabitq_refine_type}"
+
+    load_mem = loading_memory(index_mem, segment_gib, is_diskann)
+    nodes = cluster_node_config(load_mem)
+    deps = dependency_sizing(raw, load_mem)
+
+    return dict(
+        num_vectors=num_vectors, dim=dim, idx=idx, params_str=params_str,
+        formula_str=formula_str, segment_gib=segment_gib,
+        raw=raw, index_mem=index_mem, index_disk=index_disk,
+        load_mem=load_mem, nodes=nodes, deps=deps,
+    )
+
+
+def print_report(r):
+    SEP = "=" * 64
+    num_vectors = r["num_vectors"]
+    dim = r["dim"]
+    idx = r["idx"]
+
+    print(f"\n{SEP}")
+    print(f"  MILVUS SIZING — DISTRIBUTED MODE")
+    print(SEP)
+    print(f"  Vectors      : {num_vectors:>18,}")
+    print(f"  Dimensions   : {dim:>18,}")
+    idx_label = idx.upper() + (f"  ({r['params_str']})" if r["params_str"] else "")
+    print(f"  Index        : {idx_label}")
+    print(f"  Segment size : {r['segment_gib'] * 1024:.0f} MiB")
+    print(SEP)
+
+    print(f"\n  RAW DATA")
+    print(f"    {fmt(r['raw'])}")
+    print(f"    ({num_vectors:,} × {dim} × {BYTES_PER_FLOAT32} bytes/float32)")
+
+    print(f"\n  INDEX MEMORY")
+    print(f"    Formula : {r['formula_str']}")
+    print(f"    Size    : {fmt(r['index_mem'])}")
+    if r["index_disk"]:
+        print(f"    Disk    : {fmt(r['index_disk'])}")
+
+    print(f"\n  LOADING MEMORY  (index + 2×segment buffer, ×1.15 overhead)")
+    print(f"    {fmt(r['load_mem'])}")
+
+    n = r["nodes"]
+    print(f"\n  DISTRIBUTED COMPONENTS")
+    print(f"\n    Query Nodes    ×{n['qn']}")
+    print(f"      CPU : {n['qn_cpu']} vCPU each")
+    print(f"      RAM : {n['qn_mem']} GiB each")
+    print(f"\n    Data Nodes     ×{n['dn']}")
+    print(f"      CPU : {n['dn_cpu']} vCPU each")
+    print(f"      RAM : {n['dn_mem']} GiB each")
+    print(f"\n    mixCoord       ×1")
+    print(f"      CPU : {n['coord_cpu']} vCPU")
+    print(f"      RAM : {n['coord_mem']} GiB")
+    print(f"\n    Proxy          ×1")
+    print(f"      CPU : {n['proxy_cpu']} vCPU")
+    print(f"      RAM : {n['proxy_mem']} GiB")
+
+    d = r["deps"]
+    print(f"\n  DEPENDENCIES")
+    print(f"\n    MinIO  (object storage)")
+    print(f"      PVC : {d['minio_gib']} GiB")
+    print(f"\n    Pulsar  (message broker)")
+    print(f"      Ledgers : {d['pulsar_ledgers_gib']} GiB")
+    print(f"      Journal : {d['pulsar_journal_gib']} GiB")
+    print(f"\n    etcd   (3 nodes for HA)")
+    print(f"      Disk per node : {d['etcd_gib']} GiB SSD")
+
+    qn_total = n["qn"] * n["qn_mem"]
+    dn_total = n["dn"] * n["dn_mem"]
+    total_ram = qn_total + dn_total + n["coord_mem"] + n["proxy_mem"]
+    total_nodes = n["qn"] + n["dn"] + 2  # +mixCoord +proxy
+    print(f"\n  TOTALS")
+    print(f"    Milvus nodes : {total_nodes}  (+ 3 etcd + MinIO + Pulsar)")
+    print(f"    Total RAM    : ~{total_ram} GiB  (Milvus nodes)")
+    print(f"    Object store : {d['minio_gib']} GiB")
+
+    print(f"\n  VERIFY")
+    print(f"    https://milvus.io/tools/sizing")
+    print(f"    (HNSW · Distributed · {num_vectors:,} vectors · {dim} dims)")
+    print(f"\n{SEP}\n")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -169,161 +330,31 @@ def main():
                         help="Vector dimension, e.g. 1536")
     parser.add_argument("--index", type=str, default="hnsw",
                         choices=["hnsw", "flat", "ivf_flat", "ivf_sq8", "ivf_pq",
-                                 "scann", "diskann", "ivf_rabitq"],
-                        help="Index type (default: hnsw)")
-    parser.add_argument("--hnsw-m", type=int, default=30,
-                        help="HNSW M parameter, range [2, 2048] (default: 30)")
-    parser.add_argument("--nlist", type=int, default=128,
-                        help="IVF nlist, range [1, 65536] (default: 128)")
-    parser.add_argument("--ivfpq-m", type=int, default=None,
-                        help="IVF_PQ number of sub-quantizers m (default: dim/8)")
-    parser.add_argument("--ivfpq-nbits", type=int, default=8,
-                        help="IVF_PQ nbits per sub-quantizer (default: 8)")
-    parser.add_argument("--diskann-max-degree", type=int, default=56,
-                        help="DiskANN max_degree, range [1, 2048] (default: 56)")
-    parser.add_argument("--scann-with-raw-data", action="store_true",
-                        help="SCANN with_raw_data=true (default: false)")
+                                 "scann", "diskann", "ivf_rabitq"])
+    parser.add_argument("--hnsw-m", type=int, default=30)
+    parser.add_argument("--nlist", type=int, default=128)
+    parser.add_argument("--ivfpq-m", type=int, default=None)
+    parser.add_argument("--ivfpq-nbits", type=int, default=8)
+    parser.add_argument("--diskann-max-degree", type=int, default=56)
+    parser.add_argument("--scann-with-raw-data", action="store_true")
     parser.add_argument("--rabitq-refine-type", type=str, default="SQ8",
-                        choices=["SQ6", "SQ8", "FP16", "BF16", "FP32"],
-                        help="IVF_RABITQ refine_type (default: SQ8)")
-    parser.add_argument("--replicas", type=int, default=1,
-                        help="Number of data replicas (default: 1)")
-    parser.add_argument("--node-memory-gb", type=int, default=64,
-                        help="RAM per query node in GB (default: 64)")
+                        choices=["SQ6", "SQ8", "FP16", "BF16", "FP32"])
+    parser.add_argument("--segment-size-mb", type=int, default=512,
+                        choices=[512, 1024, 2048])
+    parser.add_argument("--json", action="store_true",
+                        help="Output machine-readable JSON")
     args = parser.parse_args()
 
-    num_vectors = int(args.vectors)
-    dim = args.dim
-    idx = args.index.lower()
+    result = compute(args)
 
-    raw = raw_data_size(num_vectors, dim)
-    index_mem = 0
-    index_disk = 0
-    formula_str = ""
-    params_str = ""
-
-    if idx == "hnsw":
-        M = args.hnsw_m
-        index_mem = hnsw_memory(num_vectors, dim, M)
-        formula_str = f"(1 + 2×{M}/{dim}) × raw_data_size"
-        params_str = f"M={M}"
-    elif idx == "flat":
-        index_mem = flat_memory(num_vectors, dim)
-        formula_str = "raw_data_size"
-    elif idx == "ivf_flat":
-        nlist = args.nlist
-        index_mem = ivf_flat_memory(num_vectors, dim, nlist)
-        formula_str = "raw_data_size + nlist × row_size"
-        params_str = f"nlist={nlist}"
-    elif idx == "ivf_sq8":
-        nlist = args.nlist
-        index_mem = ivf_sq8_memory(num_vectors, dim, nlist)
-        formula_str = "raw_data_size/4 + nlist × row_size"
-        params_str = f"nlist={nlist}"
-    elif idx == "ivf_pq":
-        nlist = args.nlist
-        m = args.ivfpq_m or max(1, dim // 8)
-        nbits = args.ivfpq_nbits
-        index_mem = ivf_pq_memory(num_vectors, dim, nlist, m, nbits)
-        dsub = dim / m
-        formula_str = f"raw_data_size / ({dsub:.1f} × 32/{nbits}) + nlist × row_size"
-        params_str = f"nlist={nlist}, m={m}, nbits={nbits}"
-    elif idx == "scann":
-        wr = args.scann_with_raw_data
-        index_mem = scann_memory(num_vectors, dim, wr)
-        formula_str = "(1/8 + 1) × raw_data_size" if wr else "(1/8) × raw_data_size"
-        params_str = f"with_raw_data={str(wr).lower()}"
-    elif idx == "diskann":
-        md = args.diskann_max_degree
-        index_mem, index_disk = diskann_sizing(num_vectors, dim, md)
-        formula_str = "mem: raw/4  |  disk: (1 + max_degree/dim) × raw"
-        params_str = f"max_degree={md}"
-    elif idx == "ivf_rabitq":
-        nlist = args.nlist
-        rt = args.rabitq_refine_type
-        index_mem = ivf_rabitq_memory(num_vectors, dim, nlist, rt)
-        N_map = {"SQ6": 6, "SQ8": 8, "FP16": 16, "BF16": 16, "FP32": 32}
-        N = N_map[rt.upper()]
-        formula_str = f"raw × (1+{N})/32 + nlist × row_size"
-        params_str = f"nlist={nlist}, refine_type={rt}"
-
-    recs = distributed_recommendations(
-        index_mem, raw, index_disk, args.node_memory_gb, args.replicas
-    )
-
-    # ------------------------------------------------------------------
-    # Output
-    # ------------------------------------------------------------------
-    SEP = "=" * 62
-
-    print(f"\n{SEP}")
-    print(f"  MILVUS SIZING — DISTRIBUTED MODE")
-    print(SEP)
-    print(f"  Vectors      : {num_vectors:>15,}")
-    print(f"  Dimensions   : {dim:>15,}")
-    print(f"  Index        : {idx.upper()}" + (f"  ({params_str})" if params_str else ""))
-    print(f"  Replicas     : {args.replicas}")
-    print(f"  Node memory  : {args.node_memory_gb} GB (query nodes)")
-    print(SEP)
-
-    print(f"\n  RAW DATA")
-    print(f"    Size  : {fmt(raw)}")
-    print(f"    ({num_vectors:,} vectors × {dim} dims × {BYTES_PER_FLOAT32} bytes/float32)")
-
-    print(f"\n  INDEX MEMORY")
-    print(f"    Formula : {formula_str}")
-    print(f"    Size    : {fmt(index_mem)}", end="")
-    if args.replicas > 1:
-        print(f"  ×{args.replicas} replicas = {fmt(index_mem * args.replicas)}", end="")
-    print()
-    if index_disk:
-        print(f"    Disk    : {fmt(index_disk)}")
-
-    print(f"\n  DISTRIBUTED COMPONENTS")
-    print(f"\n    Query Nodes  ×{recs['num_query_nodes']}")
-    print(f"      RAM : {recs['per_query_node_memory_gb']} GB each")
-    print(f"      CPU : {recs['query_node_cpu']} vCPU each")
-
-    print(f"\n    Data Nodes   ×{recs['num_data_nodes']}")
-    print(f"      RAM : {recs['data_node_memory_gb']} GB each")
-    print(f"      CPU : {recs['data_node_cpu']} vCPU each")
-
-    print(f"\n    Index Nodes  ×{recs['num_index_nodes']}")
-    print(f"      RAM : {recs['index_node_memory_gb']} GB each")
-    print(f"      CPU : {recs['index_node_cpu']} vCPU each")
-
-    print(f"\n    Coordinators ×1  (×3 for HA)")
-    print(f"      RAM : {recs['coordinator_memory_gb']} GB")
-    print(f"      CPU : {recs['coordinator_cpu']} vCPU")
-
-    if recs["index_disk_bytes"]:
-        per_qn = recs["index_disk_bytes"] / recs["num_query_nodes"]
-        print(f"\n    Local Disk (query nodes, DiskANN)")
-        print(f"      {fmt(per_qn)} per node")
-
-    print(f"\n  DEPENDENCIES")
-    print(f"\n    MinIO / Object Storage")
-    print(f"      Total : {fmt(recs['minio_bytes'])}")
-    print(f"      (sealed segment parquet ~60 % compressed + index files)")
-
-    print(f"\n    etcd  (3 nodes for HA)")
-    print(f"      Disk per node : {recs['etcd_gb']} GB SSD")
-
-    total_qn_ram = recs["num_query_nodes"] * recs["per_query_node_memory_gb"]
-    total_dn_ram = recs["num_data_nodes"] * recs["data_node_memory_gb"]
-    total_in_ram = recs["num_index_nodes"] * recs["index_node_memory_gb"]
-    total_ram_gb = total_qn_ram + total_dn_ram + total_in_ram + recs["coordinator_memory_gb"]
-    total_nodes = recs["num_query_nodes"] + recs["num_data_nodes"] + recs["num_index_nodes"] + 1
-
-    print(f"\n  TOTALS")
-    print(f"    Milvus nodes      : {total_nodes}  (+ 3 etcd + MinIO cluster)")
-    print(f"    Total RAM         : ~{total_ram_gb} GB  (Milvus nodes)")
-    print(f"    Object storage    : {fmt(recs['minio_bytes'])}")
-
-    print(f"\n  VERIFY")
-    print(f"    https://milvus.io/tools/sizing")
-    print(f"    (Select: HNSW, Distributed, {num_vectors:,} vectors, {dim} dims)")
-    print(f"\n{SEP}\n")
+    if args.json:
+        out = {k: v for k, v in result.items()
+               if k not in ("nodes", "deps")}
+        out["nodes"] = result["nodes"]
+        out["deps"] = result["deps"]
+        print(json.dumps(out, indent=2))
+    else:
+        print_report(result)
 
 
 if __name__ == "__main__":
